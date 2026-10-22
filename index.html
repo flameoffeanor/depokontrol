@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#111418">
+<title>Etiket Sorgu</title>
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<style>
+  :root{--bg:#111418;--card:#1b2027;--line:#2a313b;--txt:#eef1f5;--mut:#8a94a3;--ok:#2fbf71;--bad:#e5484d;--acc:#4c8dff}
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--txt);font:16px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  main{max-width:520px;margin:0 auto;padding:16px 16px calc(24px + env(safe-area-inset-bottom))}
+  header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+  h1{font-size:18px;margin:0}
+  #status{font-size:13px;color:var(--mut)}
+  #reader{width:100%;border-radius:14px;overflow:hidden;background:#000;min-height:220px}
+  #reader video{object-fit:cover}
+  button{font:inherit;border:0;border-radius:12px;padding:14px 16px;background:var(--acc);color:#fff;font-weight:600;width:100%;cursor:pointer}
+  button.sec{background:var(--card);border:1px solid var(--line);color:var(--txt)}
+  .row{display:flex;gap:8px;margin-top:10px}
+  .row>*{flex:1}
+  input{font:inherit;width:100%;padding:13px 14px;border-radius:12px;border:1px solid var(--line);background:var(--card);color:var(--txt)}
+  #result{margin-top:14px}
+  .card{background:var(--card);border:1px solid var(--line);border-left:6px solid var(--ok);border-radius:14px;padding:16px;margin-bottom:10px}
+  .card.bad{border-left-color:var(--bad)}
+  .job{font-size:26px;font-weight:700;line-height:1.2;word-break:break-word}
+  .code{font-family:ui-monospace,Menlo,monospace;color:var(--mut);font-size:14px;margin-top:4px}
+  .size{display:inline-block;margin-top:12px;padding:6px 12px;border-radius:999px;background:#253042;font-weight:700;font-size:18px}
+  .note{margin-top:12px;padding-top:12px;border-top:1px solid var(--line);white-space:pre-wrap;word-break:break-word}
+  .lbl{font-size:12px;color:var(--mut);text-transform:uppercase;letter-spacing:.04em;margin-bottom:2px}
+  .hidden{display:none}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Etiket Sorgu</h1>
+    <span id="status">Yükleniyor…</span>
+  </header>
+
+  <div id="reader"></div>
+
+  <div class="row">
+    <button id="btnScan">Taramayı başlat</button>
+  </div>
+  <div class="row">
+    <input id="manual" inputmode="numeric" placeholder="Barkodu elle yaz" autocomplete="off">
+    <button id="btnManual" class="sec" style="flex:0 0 90px">Ara</button>
+  </div>
+
+  <div id="result"></div>
+
+  <div class="row">
+    <button id="btnReload" class="sec">Listeyi yenile</button>
+  </div>
+</main>
+
+<script>
+/* ===== AYARLAR ===== */
+const SHEET_ID  = "BURAYA_SHEET_ID";   // sheet URL'sindeki /d/ ile /edit arasındaki kısım
+const SHEET_GID = "0";                 // URL'deki gid= değeri (ilk sayfa genelde 0)
+/* =================== */
+
+const $ = id => document.getElementById(id);
+let rows = [], loadedAt = 0, scanner = null, scanning = false, paused = false, lastHit = "";
+
+// Barkod karşılaştırma: sadece rakamlar, baştaki sıfırlar yok sayılır
+const norm = s => String(s ?? "").replace(/\D/g, "").replace(/^0+/, "");
+const keyOf = s => String(s ?? "").toLocaleLowerCase("tr").replace(/[^a-zçğıöşü]/g, "");
+
+function parseCSV(t) {
+  const out = []; let row = [], f = "", q = false;
+  for (let i = 0; i < t.length; i++) {
+    const c = t[i];
+    if (q) {
+      if (c === '"') { if (t[i + 1] === '"') { f += '"'; i++; } else q = false; }
+      else f += c;
+    } else if (c === '"') q = true;
+    else if (c === ",") { row.push(f); f = ""; }
+    else if (c === "\n") { row.push(f); out.push(row); row = []; f = ""; }
+    else if (c !== "\r") f += c;
+  }
+  if (f !== "" || row.length) { row.push(f); out.push(row); }
+  return out;
+}
+
+function mapColumns(header) {
+  // Varsayılan sıra: İş adı | Barkod | Beden | Notlar
+  const idx = { job: 0, code: 1, size: 2, note: 3 };
+  header.forEach((h, i) => {
+    const k = keyOf(h);
+    if (k.includes("barkod") || k.includes("ean")) idx.code = i;
+    else if (k.includes("beden")) idx.size = i;
+    else if (k.startsWith("not")) idx.note = i;
+    else if (k.startsWith("iş") || k.startsWith("is")) idx.job = i;
+  });
+  return idx;
+}
+
+async function loadSheet() {
+  $("status").textContent = "Liste yükleniyor…";
+  const url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&headers=1&gid=${SHEET_GID}&_=${Date.now()}`;
+  try {
+    const res = await fetch(url, { cache: "no-store" });
+    const text = await res.text();
+    if (!res.ok || /^\s*</.test(text)) throw new Error("Sheet okunamadı (paylaşım ayarını kontrol et)");
+    const data = parseCSV(text).filter(r => r.some(c => c.trim() !== ""));
+    if (!data.length) throw new Error("Sheet boş");
+    const c = mapColumns(data[0]);
+    rows = data.slice(1).map(r => ({
+      job:  (r[c.job]  || "").trim(),
+      code: (r[c.code] || "").trim(),
+      size: (r[c.size] || "").trim(),
+      note: (r[c.note] || "").trim(),
+    })).filter(r => norm(r.code));
+    loadedAt = Date.now();
+    $("status").textContent = `${rows.length} kayıt`;
+  } catch (e) {
+    $("status").textContent = "Hata";
+    showError(e.message);
+  }
+}
+
+function showError(msg) {
+  $("result").innerHTML = "";
+  const d = document.createElement("div");
+  d.className = "card bad";
+  d.textContent = msg;
+  $("result").appendChild(d);
+}
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+
+async function lookup(raw) {
+  const code = norm(raw);
+  if (!code) return;
+  // Liste 60 sn'den eskiyse tazele
+  if (Date.now() - loadedAt > 60000) await loadSheet();
+
+  const hits = rows.filter(r => norm(r.code) === code);
+  const box = $("result");
+  box.innerHTML = "";
+
+  if (!hits.length) {
+    const c = el("div", "card bad");
+    c.appendChild(el("div", "job", "Bulunamadı"));
+    c.appendChild(el("div", "code", String(raw).replace(/\D/g, "")));
+    box.appendChild(c);
+    if (navigator.vibrate) navigator.vibrate([80, 60, 80]);
+    return;
+  }
+
+  hits.forEach(h => {
+    const c = el("div", "card");
+    c.appendChild(el("div", "job", h.job || "(İş adı girilmemiş)"));
+    c.appendChild(el("div", "code", h.code));
+    if (h.size) c.appendChild(el("div", "size", h.size));
+    if (h.note) {
+      const n = el("div", "note");
+      n.appendChild(el("div", "lbl", "Not"));
+      n.appendChild(el("div", "", h.note));
+      c.appendChild(n);
+    }
+    box.appendChild(c);
+  });
+  if (navigator.vibrate) navigator.vibrate(60);
+}
+
+function eanValid(s) {
+  if (!/^\d{8}$|^\d{12,13}$/.test(s)) return false;
+  const d = s.split("").map(Number), chk = d.pop();
+  const sum = d.reverse().reduce((a, n, i) => a + n * (i % 2 ? 1 : 3), 0);
+  return (10 - (sum % 10)) % 10 === chk;
+}
+
+async function onScan(text) {
+  if (paused) return;
+  if (!eanValid(text)) return;          // hatalı okumaları ele
+  paused = true;
+  try { scanner.pause(true); } catch (_) {}
+  lastHit = text;
+  $("btnScan").textContent = "Tekrar tara";
+  await lookup(text);
+}
+
+async function startScan() {
+  if (scanning && paused) {             // duraklatılmışsa devam et
+    $("result").innerHTML = "";
+    try { scanner.resume(); } catch (_) {}
+    paused = false;
+    $("btnScan").textContent = "Taranıyor…";
+    return;
+  }
+  if (scanning) return;
+  if (!scanner) {
+    const F = Html5QrcodeSupportedFormats;
+    scanner = new Html5Qrcode("reader", {
+      formatsToSupport: [F.EAN_13, F.EAN_8, F.UPC_A],
+      experimentalFeatures: { useBarCodeDetectorIfSupported: true },
+      verbose: false,
+    });
+  }
+  try {
+    await scanner.start(
+      { facingMode: "environment" },
+      { fps: 12, qrbox: (w, h) => ({ width: Math.floor(w * 0.85), height: Math.floor(Math.min(h, w) * 0.45) }) },
+      onScan,
+      () => {}
+    );
+    scanning = true; paused = false;
+    $("btnScan").textContent = "Taranıyor…";
+  } catch (e) {
+    showError("Kamera açılamadı: " + (e?.message || e) + ". Tarayıcıya kamera izni ver.");
+  }
+}
+
+$("btnScan").onclick = startScan;
+$("btnReload").onclick = loadSheet;
+$("btnManual").onclick = () => lookup($("manual").value);
+$("manual").addEventListener("keydown", e => { if (e.key === "Enter") lookup($("manual").value); });
+
+loadSheet();
+</script>
+</body>
+</html>
